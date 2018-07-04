@@ -95,6 +95,10 @@ type SimpleFS struct {
 	// values are removed by SimpleFSWait (or SimpleFSCancel).
 	inProgress map[keybase1.OpID]*inprogress
 
+	subscribeLock     sync.RWMutex
+	subscribeCurrPath string
+	subscribeCurrFB   libkbfs.FolderBranch
+
 	localHTTPServer *libhttpserver.Server
 }
 
@@ -411,6 +415,77 @@ func isFiltered(filter keybase1.ListFilter, name string) bool {
 		return strings.HasPrefix(name, ".")
 	}
 	return false
+}
+
+func (k *SimpleFS) getFolderBranchFromPath(
+	ctx context.Context, path keybase1.Path) (libkbfs.FolderBranch, error) {
+	t, tlfName, _, _, err := remoteTlfAndPath(path)
+	if err != nil {
+		return libkbfs.FolderBranch{}, err
+	}
+	tlfHandle, err := libkbfs.GetHandleFromFolderNameAndType(
+		ctx, k.config.KBPKI(), k.config.MDOps(), tlfName, t)
+	if err != nil {
+		return libkbfs.FolderBranch{}, err
+	}
+
+	// Get the root node first to initialize the TLF.
+	node, _, err := k.config.KBFSOps().GetRootNode(
+		ctx, tlfHandle, libkbfs.MasterBranch)
+	if err != nil {
+		return libkbfs.FolderBranch{}, err
+	}
+	if node == nil {
+		return libkbfs.FolderBranch{}, nil
+	}
+	return node.GetFolderBranch(), nil
+}
+
+func (k *SimpleFS) refreshSubscription(
+	ctx context.Context, path keybase1.Path) error {
+	pType, err := path.PathType()
+	if err != nil {
+		return err
+	}
+	if pType != keybase1.PathType_KBFS {
+		k.log.CDebugf(ctx, "Ignoring subscription for path of type %s", pType)
+		return nil
+	}
+	pathStr := path.Kbfs()
+
+	k.subscribeLock.Lock()
+	defer k.subscribeLock.Unlock()
+	if k.subscribeCurrPath == pathStr {
+		return nil
+	}
+
+	if k.subscribeCurrPath != "" {
+		err = k.config.Notifier().UnregisterFromChanges(
+			[]libkbfs.FolderBranch{k.subscribeCurrFB}, k)
+		if err != nil {
+			return err
+		}
+	}
+
+	// TODO: when favorites caching is ready, handle folder-list paths
+	// like `/keybase/private` here.
+
+	fb, err := k.getFolderBranchFromPath(ctx, path)
+	if err != nil {
+		return err
+	}
+	if fb == (libkbfs.FolderBranch{}) {
+		return nil
+	}
+
+	err = k.config.Notifier().RegisterForChanges(
+		[]libkbfs.FolderBranch{fb}, k)
+	if err != nil {
+		return err
+	}
+	k.subscribeCurrPath = pathStr
+	k.subscribeCurrFB = fb
+	return nil
 }
 
 // SimpleFSList - Begin list of items in directory at path
@@ -1356,26 +1431,40 @@ func (k *SimpleFS) SimpleFSFolderEditHistory(
 	ctx context.Context, path keybase1.Path) (
 	res keybase1.FSFolderEditHistory, err error) {
 	ctx = k.makeContext(ctx)
-	t, tlfName, _, _, err := remoteTlfAndPath(path)
+	fb, err := k.getFolderBranchFromPath(ctx, path)
 	if err != nil {
 		return keybase1.FSFolderEditHistory{}, err
 	}
-	tlfHandle, err := libkbfs.GetHandleFromFolderNameAndType(
-		ctx, k.config.KBPKI(), k.config.MDOps(), tlfName, t)
-	if err != nil {
-		return keybase1.FSFolderEditHistory{}, err
-	}
-
-	// Get the root node first to initialize the TLF.
-	node, _, err := k.config.KBFSOps().GetRootNode(
-		ctx, tlfHandle, libkbfs.MasterBranch)
-	if err != nil {
-		return keybase1.FSFolderEditHistory{}, err
-	}
-	if node == nil {
+	if fb == (libkbfs.FolderBranch{}) {
 		return keybase1.FSFolderEditHistory{}, nil
 	}
 
 	// Now get the edit history.
-	return k.config.KBFSOps().GetEditHistory(ctx, node.GetFolderBranch())
+	return k.config.KBFSOps().GetEditHistory(ctx, fb)
+}
+
+var _ libkbfs.Observer = (*SimpleFS)(nil)
+
+// LocalChanges implements the libkbfs.Observer interface for SimpleFS.
+func (k *SimpleFS) LocalChange(
+	_ context.Context, _ libkbfs.Node, _ libkbfs.WriteRange) {
+	// No-op.
+}
+
+// BatchChanges implements the libkbfs.Observer interface for SimpleFS.
+func (k *SimpleFS) BatchChanges(
+	ctx context.Context, changes []libkbfs.NodeChange, _ []libkbfs.NodeID) {
+	k.subscribeLock.RLock()
+	defer k.subscribeLock.Unlock()
+	for _, nc := range changes {
+		fb := nc.Node.GetFolderBranch()
+		if fb == k.subscribeCurrFB {
+			k.config.Reporter().NotifyPathUpdated(ctx, k.subscribeCurrPath)
+		}
+	}
+}
+
+// TlfHandlChange implements the libkbfs.Observer interface for SimpleFS.
+func (k *SimpleFS) TlfHandleChange(_ context.Context, _ *libkbfs.TlfHandle) {
+	// TODO: the GUI might eventually care about a handle change.
 }
