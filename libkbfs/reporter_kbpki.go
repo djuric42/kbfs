@@ -80,6 +80,7 @@ type ReporterKBPKI struct {
 	config           Config
 	log              logger.Logger
 	notifyBuffer     chan *keybase1.FSNotification
+	notifyPathBuffer chan string
 	notifySyncBuffer chan *keybase1.FSPathSyncStatus
 	canceler         func()
 }
@@ -91,6 +92,7 @@ func NewReporterKBPKI(config Config, maxErrors, bufSize int) *ReporterKBPKI {
 		config:           config,
 		log:              config.MakeLogger(""),
 		notifyBuffer:     make(chan *keybase1.FSNotification, bufSize),
+		notifyPathBuffer: make(chan string, bufSize),
 		notifySyncBuffer: make(chan *keybase1.FSPathSyncStatus, bufSize),
 	}
 	var ctx context.Context
@@ -215,6 +217,20 @@ func (r *ReporterKBPKI) Notify(ctx context.Context, notification *keybase1.FSNot
 	}
 }
 
+// NotifyPathUpdated implements the Reporter interface for ReporterKBPKI.
+//
+// TODO: might be useful to get the debug tags out of ctx and store
+//       them in the notifyPathBuffer as well so that send() can put
+//       them back in its context.
+func (r *ReporterKBPKI) NotifyPathUpdated(ctx context.Context, path string) {
+	select {
+	case r.notifyPathBuffer <- path:
+	default:
+		r.log.CDebugf(ctx,
+			"ReporterKBPKI: notify path buffer full, dropping %s", path)
+	}
+}
+
 // NotifySyncStatus implements the Reporter interface for ReporterKBPKI.
 //
 // TODO: might be useful to get the debug tags out of ctx and store
@@ -250,6 +266,15 @@ func (r *ReporterKBPKI) send(ctx context.Context) {
 				notification); err != nil {
 				r.log.CDebugf(ctx, "ReporterDaemon: error sending "+
 					"notification: %s", err)
+			}
+		case path, ok := <-r.notifyPathBuffer:
+			if !ok {
+				return
+			}
+			if err := r.config.KeybaseService().NotifyPathUpdated(
+				ctx, path); err != nil {
+				r.log.CDebugf(ctx, "ReporterDaemon: error sending "+
+					"notification for path: %s", err)
 			}
 		case status, ok := <-r.notifySyncBuffer:
 			if !ok {
